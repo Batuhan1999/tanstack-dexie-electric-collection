@@ -4,6 +4,26 @@
 
 An experimental fork exploring offline-first patterns with TanStack DB, Dexie.js, and Electric SQL real-time sync.
 
+## What I Learned
+
+Building this was a rabbit hole. I started thinking "how hard can offline-first be?" and ended up mass 1500 line adapter with metadata fields I didn't know I'd need.
+
+**The hard parts nobody warns you about:**
+
+- **Sync state is messy.** You need to track: is this new? is it deleted? did we send it? what changed? what was the original value? That's why there are all those `_underscore` fields.
+
+- **Conflicts are inevitable.** Two users edit the same note offline. Who wins? I went with Last Write Wins (timestamps) because it's simple. CRDTs would be better but my brain couldn't handle it at 2am.
+
+- **The write path needs to be separate.** At first I tried calling `onInsert` directly when the user clicks save. Bad idea. Now there's a watcher (`liveQuery`) that detects unsynced rows and handles it async. Much cleaner.
+
+- **Retry logic is essential.** Networks fail. Servers timeout. You need exponential backoff and a way to revert changes when you've tried enough times.
+
+- **`fromServer` matters.** When Electric sends an update, you don't want to sync it back to the server. Sounds obvious but I broke this twice.
+
+- **Stripping internal fields is easy to forget.** Sent `_backup` and `_modifiedColumns` to my Prisma endpoint. Got very confused error messages.
+
+If you're building something similar, I hope this saves you some headaches. Or at least shows you're not alone in finding this stuff tricky.
+
 ## Credits
 
 This project is based on [HimanshuKumarDutt094/tanstack-dexie-db-collection](https://github.com/HimanshuKumarDutt094/tanstack-dexie-db-collection). I extended it to explore:
