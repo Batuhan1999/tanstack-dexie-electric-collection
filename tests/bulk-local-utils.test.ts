@@ -2,7 +2,7 @@ import "./fake-db"
 
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { createCollection } from "@tanstack/db"
-import { dexieCollectionOptions } from "../src"
+import { dexieElectricSyncOptions } from "../src"
 import {
   cleanupTestResources,
   createTestState,
@@ -22,7 +22,7 @@ describe(`Dexie Local Write Utilities`, () => {
       const { db } = await createTestState()
 
       // Override collection with handler
-      const opts = dexieCollectionOptions({
+      const opts = dexieElectricSyncOptions({
         id: `test-with-handler`,
         tableName: `test`,
         dbName: db.name,
@@ -103,7 +103,7 @@ describe(`Dexie Local Write Utilities`, () => {
       const onUpdateSpy = vi.fn()
       const { db } = await createTestState([{ id: `1`, name: `Original` }])
 
-      const opts = dexieCollectionOptions({
+      const opts = dexieElectricSyncOptions({
         id: `test-update-handler`,
         tableName: `test`,
         dbName: db.name,
@@ -134,7 +134,7 @@ describe(`Dexie Local Write Utilities`, () => {
       const { db } = await createTestState([{ id: `1`, name: `Original` }])
 
       // Test with partial mode (default)
-      const optsPartial = dexieCollectionOptions({
+      const optsPartial = dexieElectricSyncOptions({
         id: `test-partial`,
         tableName: `test`,
         dbName: db.name,
@@ -151,7 +151,7 @@ describe(`Dexie Local Write Utilities`, () => {
       expect(collectionPartial.get(`1`)?.name).toBe(`Partial Update`)
 
       // Test with full mode
-      const optsFull = dexieCollectionOptions({
+      const optsFull = dexieElectricSyncOptions({
         id: `test-full`,
         tableName: `test`,
         dbName: db.name,
@@ -187,7 +187,7 @@ describe(`Dexie Local Write Utilities`, () => {
       const onDeleteSpy = vi.fn()
       const { db } = await createTestState([{ id: `1`, name: `To Delete` }])
 
-      const opts = dexieCollectionOptions({
+      const opts = dexieElectricSyncOptions({
         id: `test-delete-handler`,
         tableName: `test`,
         dbName: db.name,
@@ -248,7 +248,7 @@ describe(`Dexie Local Write Utilities`, () => {
       const initialData = getTestData(5)
       const { db } = await createTestState(initialData)
 
-      const opts = dexieCollectionOptions({
+      const opts = dexieElectricSyncOptions({
         id: `test-websocket-handlers`,
         tableName: `test`,
         dbName: db.name,

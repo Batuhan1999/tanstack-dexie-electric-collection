@@ -3,7 +3,7 @@ import "./fake-db"
 import { afterEach, describe, expect, it } from "vitest"
 import { createCollection } from "@tanstack/db"
 import Dexie from "dexie"
-import { dexieCollectionOptions } from "../src"
+import { dexieElectricSyncOptions } from "../src"
 import {
   cleanupTestResources,
   createTestState,
@@ -60,7 +60,7 @@ describe(`Dexie Bulk Operations Stress Testing`, () => {
 
       // Provide a handler that simulates chunk processing on server side
       // New signature: onInsert receives the item directly
-      const opts2 = dexieCollectionOptions({
+      const opts2 = dexieElectricSyncOptions({
         id: `bulk-server`,
         tableName: `test`,
         dbName: db.name,
@@ -102,7 +102,7 @@ describe(`Dexie Bulk Operations Stress Testing`, () => {
 
       const seenItems: Array<string> = []
 
-      const opts = dexieCollectionOptions({
+      const opts = dexieElectricSyncOptions({
         id: `chunk-test`,
         tableName: `test`,
         dbName: db.name,
@@ -140,7 +140,7 @@ describe(`Dexie Bulk Operations Stress Testing`, () => {
       const updatesSeen: Array<any> = []
       const deletesSeen: Array<any> = []
 
-      const opts = dexieCollectionOptions({
+      const opts = dexieElectricSyncOptions({
         id: `bulk-ops`,
         tableName: `test`,
         dbName: db.name,
@@ -203,7 +203,7 @@ describe(`Dexie Bulk Operations Stress Testing`, () => {
       db.version(1).stores({ test: `&id, updatedAt` })
       await db.open()
 
-      const options = dexieCollectionOptions<{ id: string; name: string }>({
+      const options = dexieElectricSyncOptions<{ id: string; name: string }>({
         id: `concurrent-test-${i}`,
         tableName: `test`,
         dbName: dbName,

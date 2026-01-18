@@ -1,7 +1,7 @@
 import "./fake-db"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { createCollection } from "@tanstack/db"
-import { dexieCollectionOptions } from "../src/dexie"
+import { dexieElectricSyncOptions } from "../src/dexie"
 import {
   cleanupTestResources,
   createTestState,
@@ -15,7 +15,7 @@ describe(`Dexie persistence handlers`, () => {
     const { db } = await createTestState()
 
     let capturedItem: any = null
-    const opts = dexieCollectionOptions({
+    const opts = dexieElectricSyncOptions({
       id: `insert-handler`,
       tableName: `test`,
       dbName: db.name,
@@ -45,7 +45,7 @@ describe(`Dexie persistence handlers`, () => {
     let capturedChanges: any = null
     let capturedColumns: any = null
 
-    const opts = dexieCollectionOptions({
+    const opts = dexieElectricSyncOptions({
       id: `update-handler`,
       tableName: `test`,
       dbName: db.name,
@@ -78,7 +78,7 @@ describe(`Dexie persistence handlers`, () => {
 
     let capturedId: any = null
 
-    const opts = dexieCollectionOptions({
+    const opts = dexieElectricSyncOptions({
       id: `delete-handler`,
       tableName: `test`,
       dbName: db.name,
@@ -105,7 +105,7 @@ describe(`Dexie persistence handlers`, () => {
 
     let callCount = 0
 
-    const opts = dexieCollectionOptions({
+    const opts = dexieElectricSyncOptions({
       id: `retry-test`,
       tableName: `test`,
       dbName: db.name,
@@ -136,7 +136,7 @@ describe(`Dexie persistence handlers`, () => {
   it(`max retries exceeded reverts create operation`, async () => {
     const { db } = await createTestState()
 
-    const opts = dexieCollectionOptions({
+    const opts = dexieElectricSyncOptions({
       id: `revert-create`,
       tableName: `test`,
       dbName: db.name,
@@ -165,7 +165,7 @@ describe(`Dexie persistence handlers`, () => {
     const { db } = await createTestState()
 
     // No onInsert handler
-    const opts = dexieCollectionOptions({
+    const opts = dexieElectricSyncOptions({
       id: `no-handler`,
       tableName: `test`,
       dbName: db.name,
@@ -191,7 +191,7 @@ describe(`Dexie persistence handlers`, () => {
 
     const insertedItems: string[] = []
 
-    const opts = dexieCollectionOptions({
+    const opts = dexieElectricSyncOptions({
       id: `rapid-inserts`,
       tableName: `test`,
       dbName: db.name,

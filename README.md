@@ -1,30 +1,42 @@
 # TanStack Dexie Electric Collection
 
-A Dexie.js collection adapter for TanStack DB with **Electric SQL real-time sync**, offline-first persistence, automatic write path synchronization, and conflict resolution.
+> ⚠️ **Experimental** - This is an exploratory project, not a production-ready library. Use at your own risk.
 
-## Features
+An experimental fork exploring offline-first patterns with TanStack DB, Dexie.js, and Electric SQL real-time sync.
 
-- 🔄 **Electric SQL Integration** - Real-time server sync via ShapeStream
-- 💾 **Offline-First** - Full IndexedDB persistence via Dexie.js
-- ⚡ **Auto Write Path** - Automatically syncs local changes to server
-- 🔁 **Retry with Backoff** - Exponential backoff for failed syncs
-- 🤝 **Conflict Resolution** - Last Write Wins (LWW) strategy
-- 📡 **Online/Offline Handling** - Pauses sync when offline, resumes when online
-- 🗑️ **Soft Deletes** - Proper delete synchronization with `_deleted` flag
-- 📝 **Modified Columns Tracking** - Only sends changed fields on updates
-- ↩️ **Revert on Failure** - Automatic rollback when server rejects changes
+## Credits
+
+This project is based on [HimanshuKumarDutt094/tanstack-dexie-db-collection](https://github.com/HimanshuKumarDutt094/tanstack-dexie-db-collection). I extended it to explore:
+
+- Electric SQL ShapeStream integration for real-time server sync
+- Automatic write path that syncs local changes to a server
+- Conflict resolution with Last Write Wins (LWW)
+- Retry logic with exponential backoff
+- Online/offline handling
 
 ## Installation
 
+**There is no npm package.** Clone or copy the source directly:
+
 ```bash
-npm install tanstack-dexie-electric-collection @tanstack/react-db dexie
+git clone https://github.com/Batuhan1999/tanstack-dexie-electric-collection.git
 ```
 
-## Quick Start
+Then copy the `src/` folder into your project or set up a local package.
+
+### Dependencies
+
+You'll need these peer dependencies:
+
+```bash
+npm install @tanstack/react-db dexie @electric-sql/client zod
+```
+
+## Basic Example
 
 ```typescript
 import { createCollection } from "@tanstack/react-db"
-import { dexieCollectionOptions } from "tanstack-dexie-electric-collection"
+import { dexieElectricSyncOptions } from "./path-to-src"
 import { z } from "zod"
 
 const noteSchema = z.object({
@@ -35,17 +47,15 @@ const noteSchema = z.object({
 })
 
 export const notesCollection = createCollection(
-  dexieCollectionOptions({
+  dexieElectricSyncOptions({
     id: "notes",
     schema: noteSchema,
     getKey: (item) => item.id,
-    dbName: "my-app",
-    tableName: "notes",
     
-    // Electric SQL real-time sync (optional)
+    // Optional: Electric SQL endpoint for real-time sync
     shapeUrl: "http://localhost:3001/api/notes",
     
-    // Server persistence handlers
+    // Server sync handlers (called automatically by write path)
     onInsert: async (item) => {
       await fetch("/api/notes", {
         method: "POST",
@@ -55,7 +65,7 @@ export const notesCollection = createCollection(
     },
     onUpdate: async (id, changes, modifiedColumns) => {
       await fetch("/api/notes", {
-        method: "PUT",
+        method: "PUT", 
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ id, ...changes }),
       })
@@ -71,63 +81,9 @@ export const notesCollection = createCollection(
 )
 ```
 
-## Configuration Options
-
-### Required
-
-| Option | Type | Description |
-|--------|------|-------------|
-| `getKey` | `(item) => string \| number` | Function to extract unique key from item |
-
-### Database
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `id` | `string` | - | Collection identifier (used as table name if not specified) |
-| `dbName` | `string` | `'app-db'` | Dexie database name |
-| `tableName` | `string` | `id` | Dexie table name |
-| `schema` | `ZodSchema` | - | Schema for validation and type inference |
-
-### Electric SQL Sync
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `shapeUrl` | `string` | - | Electric ShapeStream URL for real-time sync |
-
-### Server Persistence Handlers
-
-| Option | Type | Description |
-|--------|------|-------------|
-| `onInsert` | `(item) => Promise<any>` | Called when local insert needs server sync |
-| `onUpdate` | `(id, changes, modifiedColumns) => Promise<any>` | Called when local update needs server sync |
-| `onDelete` | `(id) => Promise<any>` | Called when local delete needs server sync |
-
-### Write Path Configuration
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `syncRetryMaxAttempts` | `number` | `10` | Max retry attempts before giving up |
-| `syncRetryBaseDelayMs` | `number` | `1000` | Base delay for exponential backoff |
-
-### Sync Tuning
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `syncBatchSize` | `number` | `1000` | Batch size for initial sync |
-| `ackTimeoutMs` | `number` | `2000` | Acknowledgment timeout |
-| `awaitTimeoutMs` | `number` | `10000` | Await timeout for operations |
-| `rowUpdateMode` | `'partial' \| 'full'` | `'partial'` | How updates are applied |
-
-### Data Transformation
-
-| Option | Type | Description |
-|--------|------|-------------|
-| `codec.parse` | `(stored) => item` | Transform when reading from Dexie |
-| `codec.serialize` | `(item) => stored` | Transform when writing to Dexie |
-
 ## How It Works
 
-### Architecture
+### Architecture Overview
 
 ```
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
@@ -135,146 +91,122 @@ export const notesCollection = createCollection(
 │   (In-Memory)   │◀────│   (Adapter)     │◀────│   (Storage)     │
 └─────────────────┘     └─────────────────┘     └─────────────────┘
                                │
-                               │ Write Path (auto-sync)
+                               │ Write Path Watcher
+                               │ (liveQuery detects unsynced rows)
                                ▼
                         ┌─────────────────┐
                         │  Your Server    │
-                        │  (via handlers) │
+                        │  (onInsert/     │
+                        │   onUpdate/     │
+                        │   onDelete)     │
                         └─────────────────┘
                                │
                                │ Electric ShapeStream
+                               │ (real-time updates)
                                ▼
                         ┌─────────────────┐
                         │  Electric SQL   │
-                        │  (Real-time)    │
                         └─────────────────┘
 ```
 
-### Write Path Flow
+### Data Flow
 
-1. **Local Change** - User makes a change via TanStack DB
-2. **Dexie Write** - Change is immediately persisted to IndexedDB
-3. **Write Path Watcher** - `liveQuery` detects unsynced rows (`_sentToServer: false`)
-4. **Server Sync** - Calls your `onInsert`/`onUpdate`/`onDelete` handler
-5. **Success** - Marks row as synced, clears `_modifiedColumns` and `_backup`
-6. **Failure** - Retries with exponential backoff, reverts on max attempts
+**Local changes:**
+1. User makes change via TanStack DB
+2. Change written to IndexedDB immediately
+3. Write path watcher detects unsynced row
+4. Calls your `onInsert`/`onUpdate`/`onDelete` handler
+5. On success: marks as synced
+6. On failure: retries with exponential backoff, reverts after max attempts
 
-### Conflict Resolution (LWW)
+**Server changes (via Electric):**
+1. Electric ShapeStream receives server update
+2. Conflict resolution compares timestamps (LWW)
+3. If server wins: local data updated
+4. If local has newer pending changes: local wins
 
-When server data arrives via Electric:
-- **Timestamps are compared** using `_updatedAt`
-- **Server wins** if server timestamp > local timestamp
-- **Local wins** if local has pending changes with newer timestamp
-- **Server deletes always win** - deleted items are removed regardless of local changes
+### Internal Metadata
 
-### Internal Metadata Fields
+The adapter tracks sync state with internal fields (stripped before sending to server):
 
-The adapter uses these internal fields (automatically stripped from server payloads):
+```typescript
+{
+  _new: boolean,           // Created locally, not confirmed by server
+  _deleted: boolean,       // Soft-deleted, pending server sync
+  _sentToServer: boolean,  // Change has been sent
+  _modifiedColumns: string[], // Which fields changed
+  _backup: object,         // Original values for revert
+  _updatedAt: number,      // Timestamp for LWW
+  _createdAt: number,      // Creation timestamp
+}
+```
 
-| Field | Description |
-|-------|-------------|
-| `_new` | `true` if item was created locally and not yet confirmed by server |
-| `_deleted` | `true` if item is soft-deleted (pending server sync) |
-| `_sentToServer` | `true` if change has been sent to server |
-| `_modifiedColumns` | Array of field names that were changed locally |
-| `_backup` | Original values before local modification (for revert) |
-| `_updatedAt` | Local timestamp for LWW conflict resolution |
-| `_createdAt` | Local creation timestamp |
+## Configuration
+
+### Required
+
+| Option | Type | Description |
+|--------|------|-------------|
+| `getKey` | `(item) => string \| number` | Extract unique key from item |
+
+### Database
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `id` | - | Collection/table identifier |
+| `dbName` | `'app-db'` | Dexie database name |
+| `tableName` | `id` | Dexie table name |
+| `schema` | - | Zod schema for validation |
+
+### Electric Sync (Optional)
+
+| Option | Description |
+|--------|-------------|
+| `shapeUrl` | Electric ShapeStream URL |
+
+### Server Handlers
+
+| Option | Signature | Description |
+|--------|-----------|-------------|
+| `onInsert` | `(item) => Promise<any>` | Sync new item to server |
+| `onUpdate` | `(id, changes, modifiedColumns) => Promise<any>` | Sync update to server |
+| `onDelete` | `(id) => Promise<any>` | Sync delete to server |
+
+### Retry Configuration
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `syncRetryMaxAttempts` | `10` | Max retries before revert |
+| `syncRetryBaseDelayMs` | `1000` | Base delay (doubles each retry) |
 
 ## Utility Methods
 
-Access via `collection.utils`:
-
-### Database Access
-
 ```typescript
-// Get direct Dexie table access
-const table = notesCollection.utils.getTable()
-await table.where("completed").equals(true).toArray()
-```
+// Direct table access
+const table = collection.utils.getTable()
 
-### Manual Operations
-
-```typescript
 // Force refresh
-notesCollection.utils.refresh()
-await notesCollection.utils.refetch()
+collection.utils.refresh()
+await collection.utils.refetch()
 
-// Direct local writes (bypass TanStack DB)
-await notesCollection.utils.insertLocally(item, fromServer?)
-await notesCollection.utils.updateLocally(id, changes, fromServer?)
-await notesCollection.utils.deleteLocally(id, fromServer?)
+// Direct local writes (for server-originated data)
+await collection.utils.insertLocally(item, fromServer?)
+await collection.utils.updateLocally(id, changes, fromServer?)
+await collection.utils.deleteLocally(id, fromServer?)
 ```
 
-### Local Write Utilities
+### Server-Originated Data
 
-For server-originated data (e.g., WebSocket updates), use `fromServer: true`:
+When receiving data from WebSocket or other real-time sources (not Electric), use `fromServer: true`:
 
 ```typescript
-// Server sends real-time update
 socket.on("note:updated", async (data) => {
-  await notesCollection.utils.updateLocally(data.id, data, true)
+  // Won't trigger write path to sync back
+  await collection.utils.updateLocally(data.id, data, true)
 })
 ```
 
-This marks the data as synced and won't trigger the write path to sync it back.
-
-## Electric SQL Integration
-
-### Setup
-
-1. Set up Electric SQL on your server
-2. Provide the `shapeUrl` in your collection config
-3. The adapter automatically subscribes to changes
-
-```typescript
-const notesCollection = createCollection(
-  dexieCollectionOptions({
-    id: "notes",
-    schema: noteSchema,
-    getKey: (item) => item.id,
-    shapeUrl: "http://localhost:3001/api/notes", // Electric endpoint
-  })
-)
-```
-
-### What Gets Synced
-
-- **Inserts** - New items from server appear locally
-- **Updates** - Changed fields are merged with LWW
-- **Deletes** - Items are soft-deleted locally
-
-### Online/Offline Handling
-
-- **Going offline** - Electric subscription pauses
-- **Coming online** - Subscription resumes, pending changes sync
-
-## Examples
-
-### Basic CRUD
-
-```typescript
-// Insert
-const tx = notesCollection.insert({
-  id: crypto.randomUUID(),
-  content: "Hello, world!",
-  createdAt: new Date(),
-  updatedAt: new Date(),
-})
-await tx.isPersisted.promise
-
-// Update
-notesCollection.update(noteId, (note) => ({
-  ...note,
-  content: "Updated content",
-  updatedAt: new Date(),
-}))
-
-// Delete
-notesCollection.delete(noteId)
-```
-
-### With React
+## Example: React Component
 
 ```typescript
 import { useCollection } from "@tanstack/react-db"
@@ -282,74 +214,49 @@ import { useCollection } from "@tanstack/react-db"
 function Notes() {
   const { data: notes } = useCollection(notesCollection)
 
+  const addNote = () => {
+    notesCollection.insert({
+      id: crypto.randomUUID(),
+      content: "New note",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    })
+    // Automatically persisted to IndexedDB
+    // Automatically synced to server via onInsert
+  }
+
   return (
-    <ul>
-      {notes.map((note) => (
-        <li key={note.id}>{note.content}</li>
-      ))}
-    </ul>
+    <div>
+      <button onClick={addNote}>Add Note</button>
+      <ul>
+        {notes.map((note) => (
+          <li key={note.id}>{note.content}</li>
+        ))}
+      </ul>
+    </div>
   )
 }
 ```
 
-### Custom Retry Behavior
+## Known Limitations
 
-```typescript
-const notesCollection = createCollection(
-  dexieCollectionOptions({
-    id: "notes",
-    schema: noteSchema,
-    getKey: (item) => item.id,
-    
-    // Retry config
-    syncRetryMaxAttempts: 5,      // Give up after 5 attempts
-    syncRetryBaseDelayMs: 2000,   // Start with 2s delay
-    
-    onInsert: async (item) => {
-      const res = await fetch("/api/notes", {
-        method: "POST",
-        body: JSON.stringify(item),
-      })
-      if (!res.ok) throw new Error("Failed to insert")
-    },
-  })
-)
-```
+- **Experimental** - APIs may change
+- **No npm package** - Manual installation required
+- **Electric SQL specific** - Real-time sync assumes Electric ShapeStream
+- **LWW only** - No support for CRDTs or custom merge strategies
+- **Browser only** - Not tested in Node.js/SSR environments
 
-### Data Transformation
-
-```typescript
-const notesCollection = createCollection(
-  dexieCollectionOptions({
-    id: "notes",
-    schema: noteSchema,
-    getKey: (item) => item.id,
-    codec: {
-      // Parse from IndexedDB format
-      parse: (stored) => ({
-        ...stored,
-        createdAt: new Date(stored.createdAt),
-        updatedAt: new Date(stored.updatedAt),
-      }),
-      // Serialize to IndexedDB format
-      serialize: (item) => ({
-        ...item,
-        createdAt: item.createdAt.toISOString(),
-        updatedAt: item.updatedAt.toISOString(),
-      }),
-    },
-  })
-)
-```
-
-## Testing
-
-The package includes comprehensive tests. Run with:
+## Running Tests
 
 ```bash
+npm install
 npm test
 ```
 
 ## License
 
 MIT
+
+---
+
+*This is a personal exploration project. Feedback and contributions welcome, but no guarantees of maintenance or support.*

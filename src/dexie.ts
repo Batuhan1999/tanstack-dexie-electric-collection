@@ -181,21 +181,21 @@ export interface DexieUtils extends UtilsRecord {
  * @param config - Configuration options for the Dexie collection
  * @returns Collection options with utilities
  */
-export function dexieCollectionOptions<T extends StandardSchemaV1>(
+export function dexieElectricSyncOptions<T extends StandardSchemaV1>(
   config: DexieCollectionConfig<InferSchemaOutput<T>, T>
 ): CollectionConfig<InferSchemaOutput<T>, string | number, T> & {
   schema: T
   utils: DexieUtils
 }
 
-export function dexieCollectionOptions<T extends object>(
+export function dexieElectricSyncOptions<T extends object>(
   config: DexieCollectionConfig<T> & { schema?: never }
 ): CollectionConfig<T, string | number> & {
   schema?: never
   utils: DexieUtils
 }
 
-export function dexieCollectionOptions<
+export function dexieElectricSyncOptions<
   TItem extends object = Record<string, unknown>,
   TSchema extends StandardSchemaV1 = never,
 >(

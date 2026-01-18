@@ -4,7 +4,7 @@ import "./fake-db"
 import { createCollection } from "@tanstack/db"
 import { z } from "zod"
 import Dexie from "dexie"
-import { dexieCollectionOptions } from "../src/dexie"
+import { dexieElectricSyncOptions } from "../src/dexie"
 
 /**
  * Centralized function to ensure IndexedDB is available in test environment
@@ -125,7 +125,7 @@ export async function createMultiTabState(
   const dbA = await createDexieDatabase(initialA, dbid)
   const dbB = await createDexieDatabase(initialB, dbid)
 
-  const optsA = dexieCollectionOptions({
+  const optsA = dexieElectricSyncOptions({
     id: `multi-tab-a`,
     tableName: `test`,
     dbName: dbA.name,
@@ -133,7 +133,7 @@ export async function createMultiTabState(
     getKey: (item) => item.id,
   })
 
-  const optsB = dexieCollectionOptions({
+  const optsB = dexieElectricSyncOptions({
     id: `multi-tab-b`,
     tableName: `test`,
     dbName: dbB.name,
@@ -201,13 +201,13 @@ export async function createDexieDatabase(
 
 export async function createTestState(initialDocs: Array<TestItem> = []) {
   const db = await createDexieDatabase(initialDocs)
-  const options = dexieCollectionOptions({
+  const options = dexieElectricSyncOptions({
     id: `test`,
     tableName: `test`,
     dbName: db.name,
     schema: TestItemSchema,
     getKey: (item) => item.id,
-    // note: new dexieCollectionOptions uses Dexie's liveQuery internally
+    // note: new dexieElectricSyncOptions uses Dexie's liveQuery internally
     // and does not accept `startSync` or `syncBatchSize` options anymore.
   })
   const collection = createCollection(options)
@@ -259,7 +259,7 @@ export async function createNumericTestState(
   initialDocs: Array<NumericItem> = []
 ) {
   const db = await createDexieDatabase(initialDocs as any)
-  const options = dexieCollectionOptions({
+  const options = dexieElectricSyncOptions({
     id: `test-numeric`,
     tableName: `test`,
     dbName: db.name,
@@ -332,7 +332,7 @@ export async function createNumericMultiTabState(
   const dbA = await createDexieDatabase(initialA as any, dbid)
   const dbB = await createDexieDatabase(initialB as any, dbid)
 
-  const optsA = dexieCollectionOptions({
+  const optsA = dexieElectricSyncOptions({
     id: `multi-tab-numeric-a`,
     tableName: `test`,
     dbName: dbA.name,
@@ -340,7 +340,7 @@ export async function createNumericMultiTabState(
     getKey: (item: NumericItem) => item.id,
   })
 
-  const optsB = dexieCollectionOptions({
+  const optsB = dexieElectricSyncOptions({
     id: `multi-tab-numeric-b`,
     tableName: `test`,
     dbName: dbB.name,

@@ -2,7 +2,7 @@ import "./fake-db"
 import { createCollection } from "@tanstack/db"
 import { afterEach, describe, expect, it } from "vitest"
 import Dexie from "dexie"
-import { dexieCollectionOptions } from "../src"
+import { dexieElectricSyncOptions } from "../src"
 import {
   TestItemSchema,
   cleanupTestResources,
@@ -50,7 +50,7 @@ describe(`Dexie Basic Operations`, () => {
     // The previous collection was cleaned up and its driver unsubscribed.
     // Create a fresh collection instance pointed at the same DB to verify
     // that accessing the collection after cleanup restarts sync.
-    const options = dexieCollectionOptions({
+    const options = dexieElectricSyncOptions({
       id: `test-restarted`,
       tableName: `test`,
       dbName: db.name,
@@ -186,7 +186,7 @@ describe(`Dexie Basic Operations`, () => {
     const initial = getTestData(3)
     const db = await createDexieDatabase(initial)
 
-    const opts = dexieCollectionOptions({
+    const opts = dexieElectricSyncOptions({
       id: `restart-fetch`,
       tableName: `test`,
       dbName: db.name,
@@ -261,7 +261,7 @@ describe(`Dexie Basic Operations`, () => {
     const db1 = await createDexieDatabase([])
 
     // Schema-first pattern (what we're using above)
-    const schemaOptions = dexieCollectionOptions({
+    const schemaOptions = dexieElectricSyncOptions({
       id: `schema-test`,
       storeName: `test`,
       dbName: db1.name,
@@ -271,7 +271,7 @@ describe(`Dexie Basic Operations`, () => {
     })
 
     // Explicit type pattern (without schema for backward compatibility)
-    const explicitOptions = dexieCollectionOptions<TestItem>({
+    const explicitOptions = dexieElectricSyncOptions<TestItem>({
       id: `explicit-test`,
       storeName: `test`,
       dbName: db1.name,
@@ -318,7 +318,7 @@ describe(`Dexie Basic Operations`, () => {
   it(`uses codec parse/serialize when provided`, async () => {
     const db = await createDexieDatabase([])
 
-    const options = dexieCollectionOptions({
+    const options = dexieElectricSyncOptions({
       id: `codec-test`,
       tableName: `test`,
       dbName: db.name,
@@ -361,7 +361,7 @@ describe(`Dexie Basic Operations`, () => {
     const initial = getTestData(1)
     const db = await createDexieDatabase(initial)
 
-    const opts = dexieCollectionOptions({
+    const opts = dexieElectricSyncOptions({
       id: `full-update-test`,
       tableName: `test`,
       dbName: db.name,
@@ -391,7 +391,7 @@ describe(`Dexie Basic Operations`, () => {
   it(`utils.awaitIds rejects on timeout when id never seen`, async () => {
     const db = await createDexieDatabase([])
 
-    const opts = dexieCollectionOptions({
+    const opts = dexieElectricSyncOptions({
       id: `await-timeout`,
       tableName: `test`,
       dbName: db.name,

@@ -2,7 +2,7 @@ import "./fake-db"
 import { afterEach, describe, expect, it } from "vitest"
 import { createCollection } from "@tanstack/db"
 import Dexie from "dexie"
-import { dexieCollectionOptions } from "../src"
+import { dexieElectricSyncOptions } from "../src"
 import {
   cleanupTestResources,
   createTestState,
@@ -19,7 +19,7 @@ describe(`Dexie Error Handling`, () => {
     await db.open()
 
     // Create a collection with strict codec validation
-    const strictOptions = dexieCollectionOptions<{ id: string; name: string }>({
+    const strictOptions = dexieElectricSyncOptions<{ id: string; name: string }>({
       id: `strict-collection`,
       tableName: `test`,
       dbName,
@@ -70,7 +70,7 @@ describe(`Dexie Error Handling`, () => {
     const db = new Dexie(dbName)
     db.version(1).stores({ test: `&id, updatedAt` })
 
-    const options = dexieCollectionOptions<{ id: string; name: string }>({
+    const options = dexieElectricSyncOptions<{ id: string; name: string }>({
       id: `fail-collection`,
       tableName: `test`,
       dbName,
