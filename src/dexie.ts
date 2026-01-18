@@ -1,25 +1,112 @@
 import Dexie, { liveQuery } from "dexie"
 import DebugModule from "debug"
-import { addDexieMetadata, stripDexieFields } from "./helper"
+import {
+  ActionTypes,
+  addDexieMetadata,
+  needsSync,
+  stripDexieFields,
+} from "./helper"
 import type { StandardSchemaV1 } from "@standard-schema/spec"
 import type {
   CollectionConfig,
   DeleteMutationFnParams,
   InferSchemaOutput,
   InsertMutationFnParams,
+  Row,
   SyncConfig,
   UpdateMutationFnParams,
   UtilsRecord,
 } from "@tanstack/db"
 import type { Subscription, Table } from "dexie"
+import {
+  isChangeMessage,
+  isControlMessage,
+  ShapeStream,
+} from "@electric-sql/client"
+import z from "zod"
 
 const debug = DebugModule.debug(`ts/db:dexie`)
+
+// ============================================================================
+// Shape State Persistence - for resuming Electric sync across page loads
+// ============================================================================
+
+interface PersistedShapeState {
+  handle: string
+  offset: string
+  timestamp: number
+}
+
+const SHAPE_STATE_KEY = `electric_shape_state`
+const STATE_MAX_AGE_MS = 24 * 60 * 60 * 1000 // 24 hours
+
+function loadAllShapeStates(): Record<string, PersistedShapeState> {
+  try {
+    if (typeof localStorage === `undefined`) return {}
+    const stored = localStorage.getItem(SHAPE_STATE_KEY)
+    if (stored) {
+      return JSON.parse(stored)
+    }
+  } catch (e) {
+    debug(`[Electric] Failed to load shape states:`, e)
+  }
+  return {}
+}
+
+function loadShapeState(shapeName: string): PersistedShapeState | null {
+  const states = loadAllShapeStates()
+  const state = states[shapeName]
+  if (state) {
+    // Check if state is still fresh
+    if (Date.now() - state.timestamp < STATE_MAX_AGE_MS) {
+      return state
+    }
+    // State is stale, remove it
+    delete states[shapeName]
+    try {
+      localStorage.setItem(SHAPE_STATE_KEY, JSON.stringify(states))
+    } catch (e) {
+      debug(`[Electric] Failed to clear stale state:`, e)
+    }
+  }
+  return null
+}
+
+function saveShapeState(
+  shapeName: string,
+  handle: string,
+  offset: string
+): void {
+  try {
+    if (typeof localStorage === `undefined`) return
+    const states = loadAllShapeStates()
+    states[shapeName] = { handle, offset, timestamp: Date.now() }
+    localStorage.setItem(SHAPE_STATE_KEY, JSON.stringify(states))
+  } catch (e) {
+    debug(`[Electric:${shapeName}] Failed to save state:`, e)
+  }
+}
+
+function clearShapeState(shapeName: string): void {
+  try {
+    if (typeof localStorage === `undefined`) return
+    const states = loadAllShapeStates()
+    delete states[shapeName]
+    localStorage.setItem(SHAPE_STATE_KEY, JSON.stringify(states))
+  } catch (e) {
+    debug(`[Electric:${shapeName}] Failed to clear state:`, e)
+  }
+}
 
 // Optional codec interface for data transformation
 export interface DexieCodec<TItem, TStored = TItem> {
   parse?: (raw: TStored) => TItem
   serialize?: (item: TItem) => TStored
 }
+
+export const deleteSchema = z.object({
+  _deleted: z.boolean(),
+})
 
 /**
  * Configuration interface for Dexie collection options
@@ -38,9 +125,9 @@ export interface DexieCollectionConfig<
   TItem extends object = Record<string, unknown>,
   TSchema extends StandardSchemaV1 = never,
 > extends Omit<
-    CollectionConfig<TItem, string | number, TSchema>,
-    `onInsert` | `onUpdate` | `onDelete` | `getKey` | `sync`
-  > {
+  CollectionConfig<TItem, string | number, TSchema>,
+  `onInsert` | `onUpdate` | `onDelete` | `getKey` | `sync`
+> {
   dbName?: string
   tableName?: string
   storeName?: string
@@ -50,21 +137,24 @@ export interface DexieCollectionConfig<
   syncBatchSize?: number
   ackTimeoutMs?: number
   awaitTimeoutMs?: number
-  // If true, Dexie will await the user-provided persistence handler
-  // before resolving the collection handler. Default: false (fire-and-forget).
-  awaitPersistence?: boolean
-  // Timeout (ms) when awaiting user persistence handlers. Default: 5000.
-  persistenceTimeoutMs?: number
-  // If true, errors thrown by user persistence handlers will be swallowed
-  // (logged) instead of propagating. Default: true.
-  swallowPersistenceErrors?: boolean
-  // Optional user-provided persistence handlers. These will be called
-  // AFTER dexie writes complete. They receive the same params as
-  // collection mutation handlers.
-  onInsert?: (params: InsertMutationFnParams<TItem>) => Promise<any> | any
-  onUpdate?: (params: UpdateMutationFnParams<TItem>) => Promise<any> | any
-  onDelete?: (params: DeleteMutationFnParams<TItem>) => Promise<any> | any
   getKey: (item: TItem) => string | number
+  shapeUrl?: string
+
+  // Write path handlers - called by write path watcher when syncing to server
+  // These are simpler signatures than TanStack mutation params
+  onInsert?: (item: TItem) => Promise<void> | void
+  onUpdate?: (
+    id: string | number,
+    changes: Partial<TItem>,
+    modifiedColumns: string[]
+  ) => Promise<void> | void
+  onDelete?: (id: string | number) => Promise<void> | void
+
+  // Write path configuration
+  // Maximum retry attempts before silent revert. Default: 5.
+  syncRetryMaxAttempts?: number
+  // Base delay (ms) for exponential backoff. Default: 1000.
+  syncRetryBaseDelayMs?: number
 }
 
 // Enhanced utils interface
@@ -81,14 +171,6 @@ export interface DexieUtils extends UtilsRecord {
   insertLocally: (item: any) => Promise<void>
   updateLocally: (id: string | number, item: any) => Promise<void>
   deleteLocally: (id: string | number) => Promise<void>
-
-  // Bulk variants
-  bulkInsertLocally: (items: Array<any>) => Promise<void>
-  bulkUpdateLocally: (items: Array<any>) => Promise<void>
-  bulkDeleteLocally: (ids: Array<string | number>) => Promise<void>
-
-  // Sequential ID generation
-  getNextId: () => Promise<number>
 }
 
 /**
@@ -148,53 +230,19 @@ export function dexieCollectionOptions<
   // Special ID for counter record (filtered out from user queries)
   const COUNTER_ID = `__dexie_counter__`
 
-  /**
-   * Get next sequential ID for items with numeric IDs.
-   *
-   * Maintains an internal counter stored as a special record in the table.
-   * Auto-initializes from existing data on first use.
-   * Thread-safe across tabs via Dexie transactions.
-   *
-   * @returns Promise<number> - Next sequential ID (1, 2, 3, ...)
-   */
-  const getNextId = async (): Promise<number> => {
-    return await db.transaction(`rw`, table, async () => {
-      // Get counter record
-      const counterRecord = await table.get(COUNTER_ID)
-
-      let nextId: number
-
-      if (!counterRecord) {
-        // Initialize: find max user ID from existing records
-        const allRecords = await table.toArray()
-        const userRecords = allRecords.filter((r) => r.id !== COUNTER_ID)
-        const maxId = Math.max(
-          0,
-          ...userRecords.map((r) => (typeof r.id === `number` ? r.id : 0))
-        )
-
-        nextId = maxId + 1
-
-        // Store counter
-        await table.put({
-          id: COUNTER_ID,
-          _value: nextId,
-          _updatedAt: Date.now(),
-          _createdAt: Date.now(),
-        })
-      } else {
-        // Increment counter
-        nextId = (counterRecord._value || 0) + 1
-
-        await table.update(COUNTER_ID, {
-          _value: nextId,
-          _updatedAt: Date.now(),
-        })
-      }
-
-      return nextId
-    })
-  }
+  // Write path state (separate from reactive layer)
+  let writePathSubscription: Subscription | null = null
+  let isOnline = typeof navigator !== `undefined` ? navigator.onLine : true
+  let isSyncing = false
+  // Track IDs currently being synced to prevent duplicate calls
+  const syncingIds = new Set<string | number>()
+  const retryState = new Map<
+    string | number,
+    {
+      attempts: number
+      timerId?: ReturnType<typeof setTimeout>
+    }
+  >()
 
   const awaitAckedIds = async (
     ids: Array<string | number>,
@@ -293,56 +341,207 @@ export function dexieCollectionOptions<
     }
   }
 
-  // Helper to centralize calling user persistence handlers safely.
-  // Ensures no unhandled rejections, supports awaitTimeout, and respects swallow flag.
-  const safeCallPersistence = async (opts: {
-    call: () => Promise<unknown> | unknown
-    awaitPersistence?: boolean | undefined
-    timeoutMs?: number | undefined
-    swallow?: boolean | undefined
-    debugTag: string
-  }) => {
-    const { call, awaitPersistence, timeoutMs, swallow, debugTag } = opts
+  // ============================================================================
+  // Write Path (Local → Server Sync)
+  // ============================================================================
 
-    if (!awaitPersistence) {
-      // Fire-and-forget but attach a catch to avoid unhandledRejection.
-      void Promise.resolve()
-        .then(call)
-        .catch((err) => {
-          debug(`persistence:${debugTag}:error`, { error: String(err) })
-        })
+  /**
+   * Revert a failed operation silently after max retries exceeded
+   */
+  const revertOperation = async (
+    id: string | number,
+    operation: `create` | `update` | `delete`
+  ) => {
+    try {
+      if (operation === `create`) {
+        // New row was rejected - delete it entirely (never existed on server)
+        await table.delete(id)
+      } else if (operation === `delete`) {
+        // Delete was rejected - unmark as deleted
+        await table.update(id, { _deleted: false, _sentToServer: false })
+      } else if (operation === `update`) {
+        // Update was rejected - restore from backup
+        const row = (await table.get(id)) as Record<string, unknown> | undefined
+        if (row?._backup && Object.keys(row._backup as object).length > 0) {
+          await table.update(id, {
+            ...(row._backup as object),
+            _backup: null,
+            _modifiedColumns: [],
+            _sentToServer: false,
+          })
+        } else {
+          // No backup - just clear modification state
+          await table.update(id, { _modifiedColumns: [], _sentToServer: false })
+        }
+      }
+      debug(`writepath:revert`, { id: String(id), operation })
+    } catch (err) {
+      debug(`writepath:revert:error`, {
+        id: String(id),
+        operation,
+        error: String(err),
+      })
+    }
+  }
+
+  /**
+   * Handle sync error with exponential backoff retry
+   */
+  const handleSyncError = async (
+    id: string | number,
+    operation: `create` | `update` | `delete`,
+    error: unknown
+  ) => {
+    const maxAttempts = config.syncRetryMaxAttempts ?? 5
+    const baseDelay = config.syncRetryBaseDelayMs ?? 1000
+
+    const state = retryState.get(id) || { attempts: 0 }
+    state.attempts++
+
+    if (state.attempts >= maxAttempts) {
+      // Max retries exceeded - revert silently
+      await revertOperation(id, operation)
+      retryState.delete(id)
+      debug(`writepath:maxretries`, {
+        id: String(id),
+        operation,
+        attempts: state.attempts,
+      })
       return
     }
 
-    // Awaiting branch with timeout and swallow handling.
-    const tMs = timeoutMs ?? 5000
+    // Schedule retry with exponential backoff
+    const delay = baseDelay * Math.pow(2, state.attempts - 1)
+    state.timerId = setTimeout(() => {
+      retryState.delete(id)
+      void doSync()
+    }, delay)
+    retryState.set(id, state)
+
+    // Reset _sentToServer so it gets picked up again
+    await table.update(id, { _sentToServer: false })
+
+    debug(`writepath:retry`, {
+      id: String(id),
+      operation,
+      attempt: state.attempts,
+      delay,
+    })
+  }
+
+  /**
+   * Main sync function - pushes unsynced rows to server via user handlers
+   * Called directly by liveQuery when unsynced rows are detected (no debounce needed)
+   */
+  const doSync = async () => {
+    if (!isOnline || isSyncing) {
+      console.log(`[WritePath:skip]`, { isOnline, isSyncing })
+      return
+    }
+    isSyncing = true
+
     try {
-      const callP = Promise.resolve().then(call)
-      // Prevent Node emitting unhandledRejection before we await it.
-      void callP.catch(() => {})
+      const unsyncedRows = await table
+        .filter((r) => needsSync(r) && r._sentToServer !== true)
+        .toArray()
 
-      let timeoutId: NodeJS.Timeout
-      const timeoutP = new Promise<never>((_, rej) => {
-        timeoutId = setTimeout(() => rej(new Error(`persistence:timeout`)), tMs)
+      console.log(`[WritePath:found]`, {
+        count: unsyncedRows.length,
+        ids: unsyncedRows.map((r) => config.getKey(r as TItem)),
       })
-      // Prevent unhandled rejection on timeout promise
-      void timeoutP.catch(() => {})
 
-      try {
-        const result = await Promise.race([callP, timeoutP])
-        clearTimeout(timeoutId!)
-        return result
-      } catch (err) {
-        clearTimeout(timeoutId!)
-        throw err
+      for (const row of unsyncedRows) {
+        const id = config.getKey(row as TItem)
+
+        // Skip if already being synced (prevents duplicate calls from liveQuery)
+        if (syncingIds.has(id)) {
+          console.log(`[WritePath:skip-syncing]`, { id: String(id) })
+          continue
+        }
+
+        // Local-only: created and deleted before sync - hard delete
+        if (row._new && row._deleted) {
+          await table.delete(id)
+          retryState.delete(id)
+          debug(`writepath:local-only-delete`, { id: String(id) })
+          continue
+        }
+
+        // Determine operation type
+        let operation: `create` | `update` | `delete`
+
+        if (row._new) {
+          operation = `create`
+        } else if (row._deleted) {
+          operation = `delete`
+        } else if (
+          Array.isArray(row._modifiedColumns) &&
+          row._modifiedColumns.length > 0
+        ) {
+          operation = `update`
+        } else {
+          // No pending changes
+          continue
+        }
+
+        // Mark as being synced to prevent duplicate calls
+        syncingIds.add(id)
+
+        // Mark as sent BEFORE calling handler
+        await table.update(id, { _sentToServer: true })
+
+        console.log(`[WritePath:calling-handler]`, {
+          id: String(id),
+          operation,
+          _new: row._new,
+          _deleted: row._deleted,
+          _sentToServer: row._sentToServer,
+          _modifiedColumns: row._modifiedColumns,
+        })
+
+        try {
+          // Call user handler with simple signature
+          // Strip internal Dexie fields before passing to user handlers
+          const cleanedRow = stripDexieFields(row)
+
+          if (operation === `create` && config.onInsert) {
+            await config.onInsert(cleanedRow as TItem)
+          } else if (operation === `update` && config.onUpdate) {
+            const modifiedColumns = (row._modifiedColumns as string[]) || []
+            // Only include the modified columns in changes (not entire row)
+            const changes: Partial<TItem> = {}
+            for (const col of modifiedColumns) {
+              if (col in cleanedRow) {
+                ;(changes as any)[col] = (cleanedRow as any)[col]
+              }
+            }
+            await config.onUpdate(id, changes, modifiedColumns)
+          } else if (operation === `delete` && config.onDelete) {
+            await config.onDelete(id)
+          } else {
+            // No handler configured - just mark as synced
+            console.log(`[WritePath:no-handler]`, { id: String(id), operation })
+          }
+
+          // Success - clear retry state and syncing flag
+          retryState.delete(id)
+          syncingIds.delete(id)
+          console.log(`[WritePath:success]`, { id: String(id), operation })
+        } catch (err) {
+          // Handler threw - clear syncing flag and schedule retry with backoff
+          syncingIds.delete(id)
+          console.log(`[WritePath:error]`, {
+            id: String(id),
+            operation,
+            error: String(err),
+          })
+          await handleSyncError(id, operation, err)
+        }
       }
     } catch (err) {
-      if (swallow ?? true) {
-        debug(`persistence:${debugTag}:error`, { error: String(err) })
-        return
-      } else {
-        throw err
-      }
+      debug(`writepath:sync-error`, { error: String(err) })
+    } finally {
+      isSyncing = false
     }
   }
 
@@ -404,7 +603,9 @@ export function dexieCollectionOptions<
 
   const serialize = (
     item: TItem,
-    isUpdate = false
+    action: keyof typeof ActionTypes,
+    fromServer: boolean = false,
+    existingRow?: Record<string, unknown>
   ): Record<string, unknown> => {
     let serialized: unknown = item
 
@@ -416,7 +617,13 @@ export function dexieCollectionOptions<
     }
 
     // Add our metadata for efficient syncing and conflict resolution
-    return addDexieMetadata(serialized as Record<string, unknown>, isUpdate)
+    // Pass existingRow for merge logic when fromServer=true
+    return addDexieMetadata(
+      serialized as Record<string, unknown>,
+      action,
+      fromServer,
+      existingRow
+    )
   }
 
   // Track refresh triggers for manual refresh capability
@@ -463,6 +670,7 @@ export function dexieCollectionOptions<
     let lastUpdatedAt: number | undefined
     let hasMarkedReady = false
     let subscription: Subscription | null = null
+    let electricUnsubscribe: (() => void) | null = null
 
     const performInitialSync = async () => {
       // initial sync started
@@ -505,8 +713,17 @@ export function dexieCollectionOptions<
         for (const record of batchRecords) {
           // Skip counter record
           if (record.id === COUNTER_ID) continue
+          // Skip deleted records (soft-deleted items should not appear in collection)
+          if (record._deleted === true) continue
 
-          const item = parse(record)
+          let item: TItem
+          try {
+            item = parse(record)
+          } catch (err) {
+            // Skip invalid records instead of letting the sync throw
+            debug(`parse:skip`, { id: record?.id, error: err })
+            continue
+          }
 
           const key = config.getKey(item)
 
@@ -595,14 +812,22 @@ export function dexieCollectionOptions<
           // Skip counter record
           if (record.id === COUNTER_ID) continue
 
+          // Skip deleted records (soft-deleted items should not appear in collection)
+          if (record._deleted === true) continue
+
           let item: TItem
           try {
             item = parse(record)
           } catch (err) {
             // Skip invalid records instead of letting liveQuery throw
-
-            debug(`parse:skip`, { id: record?.id, error: err })
-
+            console.error(
+              `[Dexie] liveQuery: SKIPPING record due to parse error`,
+              {
+                id: record?.id,
+                record,
+                error: err,
+              }
+            )
             continue
           }
 
@@ -710,17 +935,247 @@ export function dexieCollectionOptions<
           }
         },
       })
+      // Only initialize Electric stream if shapeUrl is provided
+      if (config.shapeUrl) {
+        // Generate a unique shape name from the URL for state persistence
+        const shapeName = config.shapeUrl.replace(/[^a-zA-Z0-9]/g, `_`)
+
+        // Load persisted state to resume from last position
+        const persistedState = loadShapeState(shapeName)
+        if (persistedState) {
+          debug(`[Electric:${shapeName}] Resuming from persisted state`)
+        }
+
+        // Type assertion needed: Electric returns Row but we know it matches TItem
+        const stream = new ShapeStream<TItem & Row>({
+          url: config.shapeUrl,
+          // Resume from persisted state if available
+          ...(persistedState && {
+            handle: persistedState.handle,
+            offset: persistedState.offset as `-1` | `${number}_${number}`,
+          }),
+        })
+
+        // Subscribe to Electric stream for server-side changes
+        electricUnsubscribe = stream.subscribe(
+          async (messages) => {
+            for (const message of messages) {
+              if (isChangeMessage(message)) {
+                const { operation } = message.headers
+                const row = message.value
+
+                // Validate row has an id
+                if (
+                  !row.id ||
+                  (typeof row.id !== `string` && typeof row.id !== `number`)
+                ) {
+                  debug(
+                    `[Electric:${shapeName}] Skipping message with invalid id:`,
+                    row
+                  )
+                  continue
+                }
+
+                try {
+                  console.log(
+                    `[Electric:${shapeName}] Operation: ${operation}`,
+                    row
+                  )
+                  if (operation === `insert`) {
+                    await insertLocally(row as TItem, true)
+                  } else if (operation === `update`) {
+                    await updateLocally(row.id, row as TItem, true)
+                  } else if (operation === `delete`) {
+                    console.log(
+                      `[Electric:${shapeName}] DELETING item:`,
+                      row.id
+                    )
+                    await deleteLocally(row.id, true)
+                  }
+                } catch (err) {
+                  console.error(`[Electric:${shapeName}] Sync error:`, err)
+                }
+              } else if (isControlMessage(message)) {
+                if (message.headers.control === `up-to-date`) {
+                  // Save current position for resuming later
+                  const handle = stream.shapeHandle
+                  const offset = stream.lastOffset
+                  if (handle && offset) {
+                    saveShapeState(shapeName, handle, offset)
+                    debug(
+                      `[Electric:${shapeName}] Saved shape state at offset ${offset}`
+                    )
+                  }
+                } else if (message.headers.control === `must-refetch`) {
+                  debug(
+                    `[Electric:${shapeName}] Must refetch - server requested full resync`
+                  )
+                  clearShapeState(shapeName)
+                }
+              }
+            }
+          },
+          (error) => {
+            debug(`[Electric:${shapeName}] Stream error:`, error)
+          }
+        )
+      }
+
+      // Write path watcher - separate liveQuery for unsynced rows
+      // Calls doSync directly when changes detected (no debounce - liveQuery is already reactive)
+      writePathSubscription = liveQuery(async () => {
+        const unsyncedRows = await table
+          .filter((r) => needsSync(r) && r._sentToServer !== true)
+          .toArray()
+        // Also exclude items currently being synced
+        const filteredRows = unsyncedRows.filter(
+          (r) => !syncingIds.has(config.getKey(r as TItem))
+        )
+        return filteredRows.length
+      }).subscribe({
+        next: (count) => {
+          console.log(`[WritePath:watch]`, {
+            count,
+            isOnline,
+            isSyncing,
+            syncingIds: Array.from(syncingIds),
+          })
+          if (count > 0 && isOnline) {
+            void doSync()
+          }
+        },
+        error: (err) => {
+          console.error(`[WritePath:watch:error]`, { error: String(err) })
+        },
+      })
+
+      // Online/offline handling
+      if (typeof window !== `undefined`) {
+        const handleOffline = () => {
+          isOnline = false
+          // Pause Electric stream
+          if (electricUnsubscribe) {
+            electricUnsubscribe()
+            electricUnsubscribe = null
+          }
+          debug(`sync:offline`)
+        }
+
+        const handleOnline = () => {
+          isOnline = true
+          // Resume Electric stream - reinitialize if shapeUrl is configured
+          if (config.shapeUrl && !electricUnsubscribe) {
+            const shapeName = config.shapeUrl.replace(/[^a-zA-Z0-9]/g, `_`)
+            const persistedState = loadShapeState(shapeName)
+
+            const stream = new ShapeStream<TItem & Row>({
+              url: config.shapeUrl,
+              ...(persistedState && {
+                handle: persistedState.handle,
+                offset: persistedState.offset as `-1` | `${number}_${number}`,
+              }),
+            })
+
+            electricUnsubscribe = stream.subscribe(
+              async (messages) => {
+                for (const message of messages) {
+                  if (isChangeMessage(message)) {
+                    const { operation } = message.headers
+                    const row = message.value
+
+                    if (
+                      !row.id ||
+                      (typeof row.id !== `string` && typeof row.id !== `number`)
+                    ) {
+                      continue
+                    }
+
+                    try {
+                      if (operation === `insert`) {
+                        await insertLocally(row as TItem, true)
+                      } else if (operation === `update`) {
+                        await updateLocally(row.id, row as TItem, true)
+                      } else if (operation === `delete`) {
+                        await deleteLocally(row.id, true)
+                      }
+                    } catch (err) {
+                      debug(
+                        `[Electric:${shapeName}] Sync error on reconnect:`,
+                        {
+                          error: String(err),
+                        }
+                      )
+                    }
+                  } else if (isControlMessage(message)) {
+                    if (message.headers.control === `up-to-date`) {
+                      const handle = stream.shapeHandle
+                      const offset = stream.lastOffset
+                      if (handle && offset) {
+                        saveShapeState(shapeName, handle, offset)
+                      }
+                    } else if (message.headers.control === `must-refetch`) {
+                      clearShapeState(shapeName)
+                    }
+                  }
+                }
+              },
+              (error) => {
+                debug(`[Electric:${shapeName}] Stream error on reconnect:`, {
+                  error: String(error),
+                })
+              }
+            )
+          }
+          // Trigger write path sync
+          void doSync()
+          debug(`sync:online`)
+        }
+
+        window.addEventListener(`offline`, handleOffline)
+        window.addEventListener(`online`, handleOnline)
+
+        // Store handlers for cleanup
+        ;(cleanup as any).onlineHandler = handleOnline
+        ;(cleanup as any).offlineHandler = handleOffline
+      }
+    }
+
+    // Cleanup function reference for storing handlers
+    const cleanup = () => {
+      // 1. Reactive layer
+      if (subscription) {
+        subscription.unsubscribe()
+      }
+
+      // 2. Electric stream
+      if (electricUnsubscribe) {
+        electricUnsubscribe()
+      }
+
+      // 3. Write path
+      if (writePathSubscription) {
+        writePathSubscription.unsubscribe()
+      }
+      for (const state of retryState.values()) {
+        if (state.timerId) clearTimeout(state.timerId)
+      }
+      retryState.clear()
+
+      // 4. Online/offline listeners
+      if (typeof window !== `undefined`) {
+        const onlineHandler = (cleanup as any).onlineHandler
+        const offlineHandler = (cleanup as any).offlineHandler
+        if (onlineHandler) window.removeEventListener(`online`, onlineHandler)
+        if (offlineHandler)
+          window.removeEventListener(`offline`, offlineHandler)
+      }
     }
 
     // Start the sync process
     startSync()
 
     // Return cleanup function (critical requirement from create-collection.md)
-    return () => {
-      if (subscription) {
-        subscription.unsubscribe()
-      }
-    }
+    return cleanup
   }
 
   // Built-in mutation handlers (Pattern B) - we implement these directly using Dexie APIs
@@ -732,22 +1187,43 @@ export function dexieCollectionOptions<
 
     const mutations = insertParams.transaction.mutations
 
-    const items = mutations.map((mutation) => {
-      const item = serialize(mutation.modified, false) // false = not an update
-      return {
-        ...item,
-        id: mutation.key,
-      } as Record<string, unknown> & { id: string | number }
-    })
-
-    // bulk insert
-
     // Perform bulk operation using Dexie transaction
+    // Fetch existing rows inside transaction for consistency (handles idempotent retries)
     const txP = db.transaction(`rw`, table, async () => {
+      const keys = mutations.map((m) => m.key)
+      const existingRows = await table.bulkGet(keys)
+      const existingRowMap = new Map<string | number, Record<string, unknown>>()
+      for (let i = 0; i < keys.length; i++) {
+        if (existingRows[i]) {
+          existingRowMap.set(
+            keys[i],
+            existingRows[i] as Record<string, unknown>
+          )
+        }
+      }
+
+      const items = mutations.map((mutation) => {
+        const existingRow = existingRowMap.get(mutation.key)
+        // Use UPDATE action if row exists (idempotent retry), INSERT otherwise
+        const action = existingRow ? ActionTypes.UPDATE : ActionTypes.INSERT
+        const item = serialize(mutation.modified, action, false, existingRow)
+        return {
+          ...item,
+          id: mutation.key,
+        } as Record<string, unknown> & { id: string | number }
+      })
+
+      console.log(
+        `[Dexie] onInsert: inserting ${items.length} items to table "${tableName}"`,
+        items
+      )
       await table.bulkPut(items)
+      console.log(`[Dexie] onInsert: bulkPut completed`)
     })
-    // Attach a no-op catch immediately to avoid transient unhandled rejections
-    void txP.catch(() => {})
+    // Attach error logging to detect silent failures
+    void txP.catch((err) => {
+      console.error(`[Dexie] onInsert transaction failed:`, err)
+    })
     await txP
     await db.table(tableName).count()
 
@@ -763,17 +1239,8 @@ export function dexieCollectionOptions<
     for (const id of ids) seenIds.set(id, now)
     triggerRefresh()
 
-    // If user provided a persistence handler in config, call it AFTER local write
-    if (typeof config.onInsert === `function`) {
-      const call = () => config.onInsert!(insertParams)
-      await safeCallPersistence({
-        call,
-        awaitPersistence: config.awaitPersistence,
-        timeoutMs: config.persistenceTimeoutMs,
-        swallow: config.swallowPersistenceErrors,
-        debugTag: `onInsert`,
-      })
-    }
+    // Write path watcher will detect unsynced rows and call config.onInsert
+    // No need to call handler here - separation of concerns
 
     return ids
   }
@@ -781,39 +1248,74 @@ export function dexieCollectionOptions<
   const onUpdate = async (updateParams: UpdateMutationFnParams<TItem>) => {
     updateParams.collection.startSyncImmediate()
     const mutations = updateParams.transaction.mutations
+    debug(`onUpdate:mutations`, { count: mutations.length })
+
     const txUP = db.transaction(`rw`, table, async () => {
       for (const mutation of mutations) {
         const key = mutation.key
+        // Fetch existing row inside transaction for consistency
+        const existingRow = (await table.get(key)) as
+          | Record<string, unknown>
+          | undefined
+
+        // Store backup of current values BEFORE modification (for revert on sync rejection)
+        // Only backup if row exists and is not _new (new rows have no server state to revert to)
+        let backup: Record<string, unknown> | null = null
+        if (existingRow && !existingRow._new) {
+          const changedKeys = Object.keys(mutation.changes || {}).filter(
+            (k) => !k.startsWith(`_`)
+          )
+          // Preserve existing backup values (first modification wins)
+          backup = { ...((existingRow._backup as object) || {}) }
+          for (const k of changedKeys) {
+            if (!(k in backup)) {
+              backup[k] = existingRow[k]
+            }
+          }
+        }
+
         if (config.rowUpdateMode === `full`) {
-          const item = serialize(mutation.modified, true)
+          const item = serialize(
+            mutation.modified,
+            ActionTypes.UPDATE,
+            false,
+            existingRow
+          )
           const updateItem = {
             ...item,
+            _backup: backup,
             id: key,
           } as Record<string, unknown> & { id: string | number }
+          debug(`onUpdate:full`, { key: String(key) })
           await table.put(updateItem)
         } else {
-          const changes = serialize(mutation.changes as TItem, true)
-          await table.update(key, changes)
+          const changes = serialize(
+            mutation.changes as TItem,
+            ActionTypes.UPDATE,
+            false,
+            existingRow
+          )
+          // Include backup in the update
+          const changesWithBackup = {
+            ...changes,
+            _backup: backup,
+          }
+          debug(`onUpdate:partial`, { key: String(key) })
+          await table.update(key, changesWithBackup)
         }
       }
     })
-    void txUP.catch(() => {})
+    void txUP.catch((err) => {
+      console.error(`[Dexie] onUpdate transaction failed:`, err)
+    })
     await txUP
     const ids = mutations.map((m) => m.key)
     const now = Date.now()
     for (const id of ids) seenIds.set(id, now)
     triggerRefresh()
 
-    if (typeof config.onUpdate === `function`) {
-      const call = () => config.onUpdate!(updateParams)
-      await safeCallPersistence({
-        call,
-        awaitPersistence: config.awaitPersistence,
-        timeoutMs: config.persistenceTimeoutMs,
-        swallow: config.swallowPersistenceErrors,
-        debugTag: `onUpdate`,
-      })
-    }
+    // Write path watcher will detect unsynced rows and call config.onUpdate
+    // No need to call handler here - separation of concerns
 
     return ids
   }
@@ -825,26 +1327,46 @@ export function dexieCollectionOptions<
     const mutations = deleteParams.transaction.mutations
     const ids = mutations.map((m) => m.key)
 
-    // bulk delete
-
+    // Soft delete: set _deleted to true instead of removing the record
+    // Fetch existing rows inside transaction for consistency
     const txD = db.transaction(`rw`, table, async () => {
-      await table.bulkDelete(ids)
+      for (const mutation of mutations) {
+        const existingRow = (await table.get(mutation.key)) as
+          | Record<string, unknown>
+          | undefined
+        if (!existingRow) continue
+
+        // Use serialize with all args for proper metadata handling
+        const item = serialize(
+          existingRow as TItem,
+          ActionTypes.DELETE,
+          false,
+          existingRow
+        )
+
+        if (item._new) {
+          // New items that haven't been synced can be hard-deleted
+          await table.delete(mutation.key)
+        } else {
+          // Use the full serialized result for proper _modifiedColumns, _backup tracking
+          await table.put({ ...item, id: mutation.key })
+        }
+      }
     })
-    void txD.catch(() => {})
+    void txD.catch((err) => {
+      console.error(`[Dexie] onDelete transaction failed:`, err)
+    })
     await txD
 
-    ids.forEach((id) => seenIds.delete(id))
-
-    if (typeof config.onDelete === `function`) {
-      const call = () => config.onDelete!(deleteParams)
-      await safeCallPersistence({
-        call,
-        awaitPersistence: config.awaitPersistence,
-        timeoutMs: config.persistenceTimeoutMs,
-        swallow: config.swallowPersistenceErrors,
-        debugTag: `onDelete`,
-      })
+    // Mark as seen (item still exists, just marked deleted)
+    const now = Date.now()
+    for (const id of ids) {
+      seenIds.set(id, now)
     }
+    triggerRefresh()
+
+    // Write path watcher will detect unsynced rows and call config.onDelete
+    // No need to call handler here - separation of concerns
 
     return ids
   }
@@ -858,25 +1380,53 @@ export function dexieCollectionOptions<
    * @param item - The item to insert
    * @returns Promise that resolves when the item is persisted and visible in memory
    */
-  const insertLocally = async (item: TItem): Promise<void> => {
+  const insertLocally = async (
+    item: TItem,
+    fromServer: boolean = false
+  ): Promise<void> => {
     // Validate with schema if provided
     const validated = validateSchema(item)
-
-    const serialized = serialize(validated, false)
     const key = config.getKey(validated)
 
+    // Get existing row for merge logic (only needed when fromServer=true)
+    const existingRow = fromServer ? await table.get(key) : undefined
+
+    // Serialize handles all merge/conflict resolution via addDexieMetadata
+    const serialized = serialize(
+      validated,
+      existingRow ? ActionTypes.UPDATE : ActionTypes.INSERT,
+      fromServer,
+      existingRow as Record<string, unknown> | undefined
+    )
+
     try {
+      console.log(`[Dexie] insertLocally: writing to table "${tableName}"`, {
+        key,
+        fromServer,
+        serialized,
+      })
       await db.transaction(`rw`, table, async () => {
         await table.put({ ...serialized, id: key })
       })
+      console.log(`[Dexie] insertLocally: write completed for key "${key}"`)
+      // Verify the write
+      const count = await table.count()
+      const written = await table.get(key)
+      console.log(
+        `[Dexie] insertLocally: verification - table count: ${count}, written record:`,
+        written
+      )
     } catch (error) {
-      debug(`insertLocally:error`, { key, error: String(error) })
+      console.error(`[Dexie] insertLocally:error`, {
+        key,
+        error: String(error),
+      })
       throw new Error(
         `Failed to insert item locally: ${error instanceof Error ? error.message : String(error)}`
       )
     }
 
-    // Mark as seen and ack
+    // Mark as seen and ack (for TanStack DB sync)
     seenIds.set(key, Date.now())
     ackedIds.add(key)
     const pending = pendingAcks.get(key)
@@ -892,86 +1442,6 @@ export function dexieCollectionOptions<
   }
 
   /**
-   * Insert multiple items locally to both IndexedDB and TanStack DB memory.
-   * Does NOT trigger the user's onInsert handler.
-   *
-   * Uses bulkPut internally, so it will update existing items with the same keys.
-   * Handles partial failures gracefully - successful items are still written.
-   *
-   * @param items - Array of items to insert
-   * @returns Promise that resolves when items are persisted
-   * @throws Error with details if any items fail to insert
-   */
-  const bulkInsertLocally = async (items: Array<TItem>): Promise<void> => {
-    if (items.length === 0) return
-
-    const serializedItems = items.map((item) => {
-      const serialized = serialize(item, false)
-      const key = config.getKey(item)
-      return { ...serialized, id: key }
-    })
-
-    try {
-      await db.transaction(`rw`, table, async () => {
-        await table.bulkPut(serializedItems)
-      })
-    } catch (error) {
-      if (error instanceof Error && error.name === `BulkError`) {
-        const bulkError = error as any
-        debug(`bulkInsertLocally:partial-failure`, {
-          total: items.length,
-          failures: bulkError.failures?.length || 0,
-          errors: bulkError.failures?.map((e: Error) => e.message) || [],
-        })
-
-        // Mark successful items as seen
-        const failedPositions = new Set(
-          Object.keys(bulkError.failuresByPos || {}).map(Number)
-        )
-        const now = Date.now()
-        items.forEach((item, index) => {
-          if (!failedPositions.has(index)) {
-            const key = config.getKey(item)
-            seenIds.set(key, now)
-            ackedIds.add(key)
-            const pending = pendingAcks.get(key)
-            if (pending) {
-              pending.resolve()
-              pendingAcks.delete(key)
-            }
-          }
-        })
-
-        triggerRefresh()
-
-        throw new Error(
-          `Failed to insert ${bulkError.failures?.length || 0} of ${items.length} items locally`
-        )
-      }
-
-      debug(`bulkInsertLocally:error`, { error: String(error) })
-      throw new Error(
-        `Failed to bulk insert items locally: ${error instanceof Error ? error.message : String(error)}`
-      )
-    }
-
-    // Mark all as seen and ack
-    const now = Date.now()
-    for (const item of items) {
-      const key = config.getKey(item)
-      seenIds.set(key, now)
-      ackedIds.add(key)
-      const pending = pendingAcks.get(key)
-      if (pending) {
-        pending.resolve()
-        pendingAcks.delete(key)
-      }
-    }
-
-    triggerRefresh()
-  }
-
-  /**
    * Update an item locally in both IndexedDB and TanStack DB memory.
    * Does NOT trigger the user's onUpdate handler.
    *
@@ -981,14 +1451,25 @@ export function dexieCollectionOptions<
    */
   const updateLocally = async (
     id: string | number,
-    item: TItem
+    item: TItem,
+    fromServer: boolean = false
   ): Promise<void> => {
-    const serialized = serialize(item, true)
+    // Get existing row for merge logic
+    const existingRow = await table.get(id)
+
+    // Serialize handles all merge/conflict resolution via addDexieMetadata
+    const serialized = serialize(
+      item,
+      ActionTypes.UPDATE,
+      fromServer,
+      existingRow as Record<string, unknown> | undefined
+    )
 
     try {
       let updated = 0
       await db.transaction(`rw`, table, async () => {
-        if (config.rowUpdateMode === `full`) {
+        if (config.rowUpdateMode === `full` || fromServer) {
+          // Server updates always use put for full replacement after merge
           await table.put({ ...serialized, id })
           updated = 1
         } else {
@@ -996,8 +1477,8 @@ export function dexieCollectionOptions<
         }
       })
 
-      // In partial mode, throw if item doesn't exist
-      if (config.rowUpdateMode !== `full` && updated === 0) {
+      // In partial mode (local only), throw if item doesn't exist
+      if (!fromServer && config.rowUpdateMode !== `full` && updated === 0) {
         throw new Error(`Item with id "${id}" not found`)
       }
     } catch (error) {
@@ -1007,7 +1488,7 @@ export function dexieCollectionOptions<
       )
     }
 
-    // Mark as seen and ack
+    // Mark as seen and ack (for TanStack DB sync)
     seenIds.set(id, Date.now())
     ackedIds.add(id)
     const pending = pendingAcks.get(id)
@@ -1023,76 +1504,31 @@ export function dexieCollectionOptions<
   }
 
   /**
-   * Update multiple items locally in both IndexedDB and TanStack DB memory.
-   * Does NOT trigger the user's onUpdate handler.
-   *
-   * @param items - Array of items to update (must include keys)
-   * @returns Promise that resolves when items are persisted
-   * @throws Error with details if any items fail to update
-   */
-  const bulkUpdateLocally = async (items: Array<TItem>): Promise<void> => {
-    if (items.length === 0) return
-
-    try {
-      await db.transaction(`rw`, table, async () => {
-        if (config.rowUpdateMode === `full`) {
-          const serializedItems = items.map((item) => {
-            const serialized = serialize(item, true)
-            const key = config.getKey(item)
-            return { ...serialized, id: key }
-          })
-          await table.bulkPut(serializedItems)
-        } else {
-          // Partial mode - update each individually
-          for (const item of items) {
-            const key = config.getKey(item)
-            const serialized = serialize(item, true)
-            await table.update(key, serialized)
-          }
-        }
-      })
-    } catch (error) {
-      if (error instanceof Error && error.name === `BulkError`) {
-        const bulkError = error as any
-        debug(`bulkUpdateLocally:partial-failure`, {
-          total: items.length,
-          failures: bulkError.failures?.length || 0,
-        })
-        throw new Error(
-          `Failed to update ${bulkError.failures?.length || 0} of ${items.length} items locally`
-        )
-      }
-
-      debug(`bulkUpdateLocally:error`, { error: String(error) })
-      throw new Error(
-        `Failed to bulk update items locally: ${error instanceof Error ? error.message : String(error)}`
-      )
-    }
-
-    // Mark all as seen and ack
-    const now = Date.now()
-    for (const item of items) {
-      const key = config.getKey(item)
-      seenIds.set(key, now)
-      ackedIds.add(key)
-      const pending = pendingAcks.get(key)
-      if (pending) {
-        pending.resolve()
-        pendingAcks.delete(key)
-      }
-    }
-
-    triggerRefresh()
-  }
-
-  /**
    * Delete an item locally from both IndexedDB and TanStack DB memory.
    * Does NOT trigger the user's onDelete handler.
    *
+   * When fromServer=true (Electric sync), server delete always wins.
+   * Any local pending changes are discarded - the server is authoritative.
+   *
    * @param id - The ID of the item to delete
+   * @param fromServer - If true, this is a server-initiated delete (always wins)
    * @returns Promise that resolves when the item is deleted
    */
-  const deleteLocally = async (id: string | number): Promise<void> => {
+  const deleteLocally = async (
+    id: string | number,
+    fromServer: boolean = false
+  ): Promise<void> => {
+    // Check if item exists (for debugging)
+    if (fromServer) {
+      const localRow = await table.get(id)
+      if (!localRow) {
+        debug(`deleteLocally:server: Item ${id} already deleted locally`)
+        return // Already deleted locally, nothing to do
+      }
+      // Server delete always wins - proceed with deletion regardless of local state
+      debug(`deleteLocally:server: Deleting ${id} (server wins)`)
+    }
+
     try {
       await db.transaction(`rw`, table, async () => {
         await table.delete(id)
@@ -1112,51 +1548,6 @@ export function dexieCollectionOptions<
     triggerRefresh()
   }
 
-  /**
-   * Delete multiple items locally from both IndexedDB and TanStack DB memory.
-   * Does NOT trigger the user's onDelete handler.
-   *
-   * @param ids - Array of IDs to delete
-   * @returns Promise that resolves when items are deleted
-   * @throws Error with details if any items fail to delete
-   */
-  const bulkDeleteLocally = async (
-    ids: Array<string | number>
-  ): Promise<void> => {
-    if (ids.length === 0) return
-
-    try {
-      await db.transaction(`rw`, table, async () => {
-        await table.bulkDelete(ids)
-      })
-    } catch (error) {
-      if (error instanceof Error && error.name === `BulkError`) {
-        const bulkError = error as any
-        debug(`bulkDeleteLocally:partial-failure`, {
-          total: ids.length,
-          failures: bulkError.failures?.length || 0,
-        })
-        throw new Error(
-          `Failed to delete ${bulkError.failures?.length || 0} of ${ids.length} items locally`
-        )
-      }
-
-      debug(`bulkDeleteLocally:error`, { error: String(error) })
-      throw new Error(
-        `Failed to bulk delete items locally: ${error instanceof Error ? error.message : String(error)}`
-      )
-    }
-
-    // Remove all from tracking
-    for (const id of ids) {
-      seenIds.delete(id)
-      ackedIds.delete(id)
-      pendingAcks.delete(id)
-    }
-
-    triggerRefresh()
-  }
-
   const utils: DexieUtils = {
     getTable: () => table as Table<Record<string, unknown>, string | number>,
     awaitIds,
@@ -1168,10 +1559,6 @@ export function dexieCollectionOptions<
     insertLocally,
     updateLocally,
     deleteLocally,
-    bulkInsertLocally,
-    bulkUpdateLocally,
-    bulkDeleteLocally,
-    getNextId,
   }
 
   return {

@@ -3,11 +3,15 @@ import { afterEach, describe, expect, it } from "vitest"
 import { createCollection } from "@tanstack/db"
 import Dexie from "dexie"
 import { dexieCollectionOptions } from "../src"
-import { cleanupTestResources, createTestState } from "./test-helpers"
+import {
+  cleanupTestResources,
+  createTestState,
+  waitForKey,
+} from "./test-helpers"
 
 describe(`Dexie Error Handling`, () => {
   afterEach(cleanupTestResources)
-
+  
   it(`handles codec parse failures gracefully`, async () => {
     const dbName = `strict-test-${Date.now()}`
     const db = new Dexie(dbName)
@@ -42,6 +46,7 @@ describe(`Dexie Error Handling`, () => {
       name: `Valid Item`,
     })
     await validTx.isPersisted.promise
+    await waitForKey(strictCollection, `valid`, 500)
     expect(strictCollection.get(`valid`)).toBeTruthy()
 
     // Try to manually insert invalid data to the database
