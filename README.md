@@ -1,474 +1,355 @@
-# Unofficial Dexie Collection
+# TanStack Dexie Electric Collection
 
-Dexie collections provide seamless integration between TanStack DB and [Dexie.js](https://dexie.org), enabling a local-first persistence layer with efficient change monitoring and IndexedDB storage. This integration keeps an in-memory TanStack DB collection in perfect sync with a Dexie table while supporting optimistic updates, efficient syncing, and reactive live updates.
+A Dexie.js collection adapter for TanStack DB with **Electric SQL real-time sync**, offline-first persistence, automatic write path synchronization, and conflict resolution.
 
-## Overview
+## Features
 
-The `tanstack-dexie-db-collection` package allows you to create collections that:
-
-- Automatically sync with IndexedDB through Dexie.js for offline-first persistence
-- Reactively update when Dexie data changes using `liveQuery`
-- Support optimistic mutations with acknowledgment tracking
-- Handle efficient initial syncing with configurable batch sizes
-- Provide utilities for testing and advanced integration scenarios
-- Use metadata fields for efficient sync and conflict resolution
+- 🔄 **Electric SQL Integration** - Real-time server sync via ShapeStream
+- 💾 **Offline-First** - Full IndexedDB persistence via Dexie.js
+- ⚡ **Auto Write Path** - Automatically syncs local changes to server
+- 🔁 **Retry with Backoff** - Exponential backoff for failed syncs
+- 🤝 **Conflict Resolution** - Last Write Wins (LWW) strategy
+- 📡 **Online/Offline Handling** - Pauses sync when offline, resumes when online
+- 🗑️ **Soft Deletes** - Proper delete synchronization with `_deleted` flag
+- 📝 **Modified Columns Tracking** - Only sends changed fields on updates
+- ↩️ **Revert on Failure** - Automatic rollback when server rejects changes
 
 ## Installation
 
 ```bash
-npm install tanstack-dexie-db-collection @tanstack/react-db
+npm install tanstack-dexie-electric-collection @tanstack/react-db dexie
 ```
 
-## Basic Usage
-
-Create a TanStack DB collection that automatically syncs with a Dexie table:
+## Quick Start
 
 ```typescript
 import { createCollection } from "@tanstack/react-db"
-import { dexieCollectionOptions } from "tanstack-dexie-db-collection"
+import { dexieCollectionOptions } from "tanstack-dexie-electric-collection"
 import { z } from "zod"
 
-const todoSchema = z.object({
+const noteSchema = z.object({
   id: z.string(),
-  text: z.string(),
-  completed: z.boolean(),
+  content: z.string(),
+  createdAt: z.coerce.date(),
+  updatedAt: z.coerce.date(),
 })
 
-const todosCollection = createCollection(
+export const notesCollection = createCollection(
   dexieCollectionOptions({
-    id: "todos",
-    schema: todoSchema,
+    id: "notes",
+    schema: noteSchema,
     getKey: (item) => item.id,
+    dbName: "my-app",
+    tableName: "notes",
+    
+    // Electric SQL real-time sync (optional)
+    shapeUrl: "http://localhost:3001/api/notes",
+    
+    // Server persistence handlers
+    onInsert: async (item) => {
+      await fetch("/api/notes", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(item),
+      })
+    },
+    onUpdate: async (id, changes, modifiedColumns) => {
+      await fetch("/api/notes", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id, ...changes }),
+      })
+    },
+    onDelete: async (id) => {
+      await fetch("/api/notes", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id }),
+      })
+    },
   })
 )
 ```
-
-This creates a collection that:
-
-- Uses IndexedDB for persistence via Dexie
-- Automatically creates a database named `app-db` with a table named `todos`
-- Keeps the in-memory collection and Dexie table in sync
-- Supports all standard TanStack DB operations
 
 ## Configuration Options
 
-The `dexieCollectionOptions` function accepts the following options:
+### Required
 
-### Required Options
+| Option | Type | Description |
+|--------|------|-------------|
+| `getKey` | `(item) => string \| number` | Function to extract unique key from item |
 
-- `getKey`: Function to extract the unique key from an item
+### Database
 
-### Database Configuration
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `id` | `string` | - | Collection identifier (used as table name if not specified) |
+| `dbName` | `string` | `'app-db'` | Dexie database name |
+| `tableName` | `string` | `id` | Dexie table name |
+| `schema` | `ZodSchema` | - | Schema for validation and type inference |
 
-- `id`: Unique identifier for the collection (also used as table name if not specified)
-- `dbName`: Dexie database name (default: `'app-db'`)
-- `tableName` / `storeName`: Name of the Dexie table (defaults to the collection `id`)
+### Electric SQL Sync
 
-### Schema and Validation
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `shapeUrl` | `string` | - | Electric ShapeStream URL for real-time sync |
 
-- `schema`: Schema for type inference and optional runtime validation (Standard Schema v1, Zod, etc.)
+### Server Persistence Handlers
 
-### Sync Configuration
+| Option | Type | Description |
+|--------|------|-------------|
+| `onInsert` | `(item) => Promise<any>` | Called when local insert needs server sync |
+| `onUpdate` | `(id, changes, modifiedColumns) => Promise<any>` | Called when local update needs server sync |
+| `onDelete` | `(id) => Promise<any>` | Called when local delete needs server sync |
 
-- `syncBatchSize`: Batch size for initial sync (default: `1000`)
-- `rowUpdateMode`: Update strategy - `'partial'` or `'full'` (default: `'partial'`)
+### Write Path Configuration
 
-### Timeouts
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `syncRetryMaxAttempts` | `number` | `10` | Max retry attempts before giving up |
+| `syncRetryBaseDelayMs` | `number` | `1000` | Base delay for exponential backoff |
 
-- `ackTimeoutMs`: Timeout for acknowledgment tracking (default: `2000ms`)
-- `awaitTimeoutMs`: Timeout for awaiting IDs (default: `10000ms`)
+### Sync Tuning
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `syncBatchSize` | `number` | `1000` | Batch size for initial sync |
+| `ackTimeoutMs` | `number` | `2000` | Acknowledgment timeout |
+| `awaitTimeoutMs` | `number` | `10000` | Await timeout for operations |
+| `rowUpdateMode` | `'partial' \| 'full'` | `'partial'` | How updates are applied |
 
 ### Data Transformation
 
-- `codec`: Optional data transformation between stored and in-memory shapes
+| Option | Type | Description |
+|--------|------|-------------|
+| `codec.parse` | `(stored) => item` | Transform when reading from Dexie |
+| `codec.serialize` | `(item) => stored` | Transform when writing to Dexie |
 
-## Usage with Schema
+## How It Works
 
-Provide a schema for type inference and validation:
+### Architecture
 
-```typescript
-import { z } from "zod"
-
-const todoSchema = z.object({
-  id: z.string(),
-  text: z.string(),
-  completed: z.boolean(),
-  createdAt: z.date().optional(),
-})
-
-const todosCollection = createCollection(
-  dexieCollectionOptions({
-    id: "todos",
-    schema: todoSchema,
-    getKey: (item) => item.id, // `item` is fully typed from schema
-    dbName: "my-todo-app",
-    tableName: "todos",
-  })
-)
+```
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│   TanStack DB   │────▶│   Dexie.js      │────▶│   IndexedDB     │
+│   (In-Memory)   │◀────│   (Adapter)     │◀────│   (Storage)     │
+└─────────────────┘     └─────────────────┘     └─────────────────┘
+                               │
+                               │ Write Path (auto-sync)
+                               ▼
+                        ┌─────────────────┐
+                        │  Your Server    │
+                        │  (via handlers) │
+                        └─────────────────┘
+                               │
+                               │ Electric ShapeStream
+                               ▼
+                        ┌─────────────────┐
+                        │  Electric SQL   │
+                        │  (Real-time)    │
+                        └─────────────────┘
 ```
 
-When using a schema:
+### Write Path Flow
 
-- The `getKey` function is fully typed
-- Runtime validation is automatically applied
-- Type inference works seamlessly
+1. **Local Change** - User makes a change via TanStack DB
+2. **Dexie Write** - Change is immediately persisted to IndexedDB
+3. **Write Path Watcher** - `liveQuery` detects unsynced rows (`_sentToServer: false`)
+4. **Server Sync** - Calls your `onInsert`/`onUpdate`/`onDelete` handler
+5. **Success** - Marks row as synced, clears `_modifiedColumns` and `_backup`
+6. **Failure** - Retries with exponential backoff, reverts on max attempts
 
-## Advanced Configuration
+### Conflict Resolution (LWW)
 
-### Custom Database and Table Names
+When server data arrives via Electric:
+- **Timestamps are compared** using `_updatedAt`
+- **Server wins** if server timestamp > local timestamp
+- **Local wins** if local has pending changes with newer timestamp
+- **Server deletes always win** - deleted items are removed regardless of local changes
+
+### Internal Metadata Fields
+
+The adapter uses these internal fields (automatically stripped from server payloads):
+
+| Field | Description |
+|-------|-------------|
+| `_new` | `true` if item was created locally and not yet confirmed by server |
+| `_deleted` | `true` if item is soft-deleted (pending server sync) |
+| `_sentToServer` | `true` if change has been sent to server |
+| `_modifiedColumns` | Array of field names that were changed locally |
+| `_backup` | Original values before local modification (for revert) |
+| `_updatedAt` | Local timestamp for LWW conflict resolution |
+| `_createdAt` | Local creation timestamp |
+
+## Utility Methods
+
+Access via `collection.utils`:
+
+### Database Access
 
 ```typescript
-import { z } from "zod"
+// Get direct Dexie table access
+const table = notesCollection.utils.getTable()
+await table.where("completed").equals(true).toArray()
+```
 
-const todoSchema = z.object({
-  id: z.string(),
-  text: z.string(),
-  completed: z.boolean(),
+### Manual Operations
+
+```typescript
+// Force refresh
+notesCollection.utils.refresh()
+await notesCollection.utils.refetch()
+
+// Direct local writes (bypass TanStack DB)
+await notesCollection.utils.insertLocally(item, fromServer?)
+await notesCollection.utils.updateLocally(id, changes, fromServer?)
+await notesCollection.utils.deleteLocally(id, fromServer?)
+```
+
+### Local Write Utilities
+
+For server-originated data (e.g., WebSocket updates), use `fromServer: true`:
+
+```typescript
+// Server sends real-time update
+socket.on("note:updated", async (data) => {
+  await notesCollection.utils.updateLocally(data.id, data, true)
 })
+```
 
-const todosCollection = createCollection(
+This marks the data as synced and won't trigger the write path to sync it back.
+
+## Electric SQL Integration
+
+### Setup
+
+1. Set up Electric SQL on your server
+2. Provide the `shapeUrl` in your collection config
+3. The adapter automatically subscribes to changes
+
+```typescript
+const notesCollection = createCollection(
   dexieCollectionOptions({
-    id: "todos",
-    schema: todoSchema,
-    dbName: "my-app-db",
-    tableName: "user_todos",
+    id: "notes",
+    schema: noteSchema,
     getKey: (item) => item.id,
+    shapeUrl: "http://localhost:3001/api/notes", // Electric endpoint
   })
 )
 ```
 
-### Row Update Modes
+### What Gets Synced
 
-Control how updates are applied to Dexie:
+- **Inserts** - New items from server appear locally
+- **Updates** - Changed fields are merged with LWW
+- **Deletes** - Items are soft-deleted locally
+
+### Online/Offline Handling
+
+- **Going offline** - Electric subscription pauses
+- **Coming online** - Subscription resumes, pending changes sync
+
+## Examples
+
+### Basic CRUD
 
 ```typescript
-import { z } from "zod"
-
-const todoSchema = z.object({
-  id: z.string(),
-  text: z.string(),
-  completed: z.boolean(),
+// Insert
+const tx = notesCollection.insert({
+  id: crypto.randomUUID(),
+  content: "Hello, world!",
+  createdAt: new Date(),
+  updatedAt: new Date(),
 })
+await tx.isPersisted.promise
 
-const todosCollection = createCollection(
+// Update
+notesCollection.update(noteId, (note) => ({
+  ...note,
+  content: "Updated content",
+  updatedAt: new Date(),
+}))
+
+// Delete
+notesCollection.delete(noteId)
+```
+
+### With React
+
+```typescript
+import { useCollection } from "@tanstack/react-db"
+
+function Notes() {
+  const { data: notes } = useCollection(notesCollection)
+
+  return (
+    <ul>
+      {notes.map((note) => (
+        <li key={note.id}>{note.content}</li>
+      ))}
+    </ul>
+  )
+}
+```
+
+### Custom Retry Behavior
+
+```typescript
+const notesCollection = createCollection(
   dexieCollectionOptions({
-    id: "todos",
-    schema: todoSchema,
+    id: "notes",
+    schema: noteSchema,
     getKey: (item) => item.id,
-    rowUpdateMode: "full", // Use table.put for full replacement
-    // rowUpdateMode: 'partial', // Use table.update for partial updates (default)
+    
+    // Retry config
+    syncRetryMaxAttempts: 5,      // Give up after 5 attempts
+    syncRetryBaseDelayMs: 2000,   // Start with 2s delay
+    
+    onInsert: async (item) => {
+      const res = await fetch("/api/notes", {
+        method: "POST",
+        body: JSON.stringify(item),
+      })
+      if (!res.ok) throw new Error("Failed to insert")
+    },
   })
 )
 ```
 
-### Data Transformation with Codec
-
-Transform data between stored and in-memory formats:
+### Data Transformation
 
 ```typescript
-import { z } from "zod"
-
-const todoSchema = z.object({
-  id: z.string(),
-  text: z.string(),
-  completed: z.boolean(),
-  createdAt: z.date().optional(),
-})
-
-const todosCollection = createCollection(
+const notesCollection = createCollection(
   dexieCollectionOptions({
-    id: "todos",
-    schema: todoSchema,
+    id: "notes",
+    schema: noteSchema,
     getKey: (item) => item.id,
     codec: {
-      // Transform when reading from Dexie
+      // Parse from IndexedDB format
       parse: (stored) => ({
         ...stored,
-        createdAt: stored.createdAt ? new Date(stored.createdAt) : undefined,
+        createdAt: new Date(stored.createdAt),
+        updatedAt: new Date(stored.updatedAt),
       }),
-      // Transform when writing to Dexie
+      // Serialize to IndexedDB format
       serialize: (item) => ({
         ...item,
-        createdAt: item.createdAt?.toISOString(),
+        createdAt: item.createdAt.toISOString(),
+        updatedAt: item.updatedAt.toISOString(),
       }),
     },
   })
 )
 ```
 
-### Sync Optimization
+## Testing
 
-Configure sync behavior for large datasets:
+The package includes comprehensive tests. Run with:
 
-```typescript
-import { z } from "zod"
-
-const todoSchema = z.object({
-  id: z.string(),
-  text: z.string(),
-  completed: z.boolean(),
-})
-
-const todosCollection = createCollection(
-  dexieCollectionOptions({
-    id: "todos",
-    schema: todoSchema,
-    getKey: (item) => item.id,
-    syncBatchSize: 500, // Smaller batches for memory optimization
-    ackTimeoutMs: 5000, // Longer timeout for slow devices
-    awaitTimeoutMs: 15000, // Extended timeout for tests
-  })
-)
+```bash
+npm test
 ```
 
-## How Syncing Works
+## License
 
-### Initial Sync
-
-1. **Batch Loading**: Reads Dexie rows in batches for efficient transfer
-2. **Live Updates**: Uses Dexie's `liveQuery` for real-time reactive updates
-3. **Change Detection**: Efficient diffing prevents unnecessary updates
-
-## Utility Methods
-
-The collection provides utility methods via `collection.utils`:
-
-### Database Access
-
-```typescript
-// Get direct access to the Dexie table
-const table = todosCollection.utils.getTable()
-await table.where("completed").equals(true).toArray()
-```
-
-### Manual Refresh
-
-```typescript
-// Force the liveQuery to re-evaluate
-todosCollection.utils.refresh()
-
-// Trigger refresh and wait for processing
-await todosCollection.utils.refetch()
-```
-
-### Sequential ID Generation
-
-For collections that need sequential numeric IDs (1, 2, 3...) instead of UUIDs, use the `getNextId()` utility:
-
-```typescript
-import { z } from "zod"
-
-// Schema with numeric ID
-const todoSchema = z.object({
-  id: z.number(),
-  text: z.string(),
-  completed: z.boolean(),
-})
-
-const todosCollection = createCollection(
-  dexieCollectionOptions({
-    id: "todos",
-    schema: todoSchema,
-    getKey: (item) => item.id,
-  })
-)
-
-// Generate sequential IDs
-async function addTodo(text: string) {
-  const nextId = await todosCollection.utils.getNextId()
-
-  const tx = todosCollection.insert({
-    id: nextId, // 1, 2, 3, 4...
-    text,
-    completed: false,
-  })
-
-  await tx.isPersisted.promise
-}
-
-// Usage
-await addTodo("Buy milk") // Creates todo with id: 1
-await addTodo("Walk dog") // Creates todo with id: 2
-await addTodo("Write code") // Creates todo with id: 3
-```
-
-**Features:**
-- Auto-initializes from max existing ID on first use
-- Thread-safe across browser tabs via Dexie transactions
-- Counter never decreases (deletions create gaps, which is normal)
-- Stored internally as a special record (filtered from queries)
-
-**Example with bootstrap:**
-
-```typescript
-// Bootstrap from server
-const serverTodos = await fetch("/api/todos").then((r) => r.json())
-await todosCollection.utils.bulkInsertLocally(serverTodos)
-// If server has IDs 1-100, counter initializes to 100
-
-// Create new todo
-const nextId = await todosCollection.utils.getNextId() // Returns 101
-```
-
-## External backend sync
-
-This repo includes copy-paste-ready examples for persistence handlers and backend sync in `EXAMPLES.md` (project root). See that file for complete snippets. Minimal summary:
-
-- Handlers receive `{ transaction }`. Use `transaction.mutations` (array of `{ type, key, modified, changes }`) for your backend payloads.
-- Default is fire-and-forget. Set `awaitPersistence: true` to wait for the handler to complete before marking the operation persisted.
-- Errors are swallowed by default; toggle `swallowPersistenceErrors` to change this behavior. Use `persistenceTimeoutMs` to bound wait time.
-- Handlers run only after local Dexie writes succeed.
-
-## Live Query Integration
-
-Dexie collections work seamlessly with live queries for reactive data access. You can create filtered, sorted views that automatically update when the underlying data changes.
-
-### Basic Live Query Example
-
-```typescript
-import {
-  createCollection,
-  liveQueryCollectionOptions,
-  eq,
-} from "@tanstack/react-db"
-import { dexieCollectionOptions } from "tanstack-dexie-db-collection"
-import { z } from "zod"
-
-const noteSchema = z.object({
-  id: z.string(),
-  title: z.string(),
-  content: z.string(),
-  isPinned: z.boolean(),
-  updatedAt: z.date(),
-})
-
-// Base collection with Dexie persistence
-const notesCollection = createCollection(
-  dexieCollectionOptions({
-    id: "notes",
-    schema: noteSchema,
-    getKey: (note) => note.id,
-  })
-)
-
-// Live query for pinned notes
-export const pinnedNotesCollection = createCollection(
-  liveQueryCollectionOptions({
-    id: "pinned-notes-live",
-    startSync: true,
-    query: (q) =>
-      q
-        .from({ note: notesCollection })
-        .where(({ note }) => eq(note.isPinned, true))
-        .orderBy(({ note }) => note.updatedAt, "desc"),
-  })
-)
-
-// Use in React component
-function PinnedNotes() {
-  const { data: pinnedNotes } = useLiveQuery(pinnedNotesCollection)
-
-  return (
-    <div>
-      {pinnedNotes.map((note) => (
-        <div key={note.id}>{note.title}</div>
-      ))}
-    </div>
-  )
-}
-```
-
-### Advanced Live Query with Joins
-
-```typescript
-import {
-  createCollection,
-  liveQueryCollectionOptions,
-  eq,
-  gt,
-} from "@tanstack/react-db"
-import { z } from "zod"
-
-const userSchema = z.object({
-  id: z.string(),
-  name: z.string(),
-  isActive: z.boolean(),
-})
-
-const taskSchema = z.object({
-  id: z.string(),
-  title: z.string(),
-  userId: z.string(),
-  priority: z.number(),
-  dueDate: z.date(),
-})
-
-// Base collections
-const usersCollection = createCollection(
-  dexieCollectionOptions({
-    id: "users",
-    schema: userSchema,
-    getKey: (user) => user.id,
-  })
-)
-
-const tasksCollection = createCollection(
-  dexieCollectionOptions({
-    id: "tasks",
-    schema: taskSchema,
-    getKey: (task) => task.id,
-  })
-)
-
-// Live query for active user tasks
-export const activeUserTasksCollection = createCollection(
-  liveQueryCollectionOptions({
-    id: "active-user-tasks",
-    startSync: true,
-    query: (q) =>
-      q
-        .from({ user: usersCollection })
-        .join({ task: tasksCollection }, ({ user, task }) =>
-          eq(user.id, task.userId)
-        )
-        .where(({ user }) => eq(user.isActive, true))
-        .where(({ task }) => gt(task.priority, 2))
-        .select(({ user, task }) => ({
-          taskId: task.id,
-          taskTitle: task.title,
-          userName: user.name,
-          priority: task.priority,
-          dueDate: task.dueDate,
-        }))
-        .orderBy(({ task }) => task.dueDate, "asc"),
-  })
-)
-
-// Use in component
-function HighPriorityTasks() {
-  const { data: tasks } = useLiveQuery(activeUserTasksCollection)
-
-  return (
-    <div>
-      <h2>High Priority Tasks</h2>
-      {tasks.map((task) => (
-        <div key={task.taskId}>
-          <h3>{task.taskTitle}</h3>
-          <p>Assigned to: {task.userName}</p>
-          <p>Priority: {task.priority}</p>
-          <p>Due: {task.dueDate}</p>
-        </div>
-      ))}
-    </div>
-  )
-}
-```
-
-The live queries automatically update when:
-
-- Notes are pinned/unpinned in the base collection
-- Users' active status changes
-- Tasks are added, modified, or their priority changes
-- Due dates are updated
-
-This provides a reactive, real-time UI that stays in sync with your IndexedDB data.
+MIT
