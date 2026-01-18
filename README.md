@@ -1,12 +1,18 @@
 # TanStack Dexie Electric Collection
 
-> ⚠️ **Experimental** - This is an exploratory project, not a production-ready library. Use at your own risk.
+> ⚠️ **Experimental** - This is a learning project, not a production-ready library. Use at your own risk.
 
 An experimental fork exploring offline-first patterns with TanStack DB, Dexie.js, and Electric SQL real-time sync.
 
+## Why I Built This
+
+I was learning Electric SQL and came across [this TanStack DB issue about persistence](https://github.com/TanStack/db/issues/865). The discussion laid out all the hard problems: sync state, multi-tab conflicts, schema evolution, larger-than-memory data. I thought "let me try to build something simple and see how far I get."
+
+Turns out, not that simple.
+
 ## What I Learned
 
-Building this was a rabbit hole. I started thinking "how hard can offline-first be?" and ended up mass 1500 line adapter with metadata fields I didn't know I'd need.
+Building this was a rabbit hole. I started thinking "how hard can offline-first be?" and ended up with a 1500 line adapter with metadata fields I didn't know I'd need.
 
 **The hard parts nobody warns you about:**
 
@@ -279,4 +285,4 @@ MIT
 
 ---
 
-*This is a personal exploration project. Feedback and contributions welcome, but no guarantees of maintenance or support.*
+*This was a learning project to understand offline-first sync patterns. If you're exploring similar problems, I hope the code and notes here help.*
